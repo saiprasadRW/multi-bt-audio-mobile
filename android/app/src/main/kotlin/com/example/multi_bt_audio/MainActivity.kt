@@ -5,6 +5,8 @@ import android.bluetooth.*
 import android.content.Context
 import android.content.Intent
 import android.media.projection.MediaProjectionManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -89,19 +91,28 @@ class MainActivity : FlutterActivity() {
 
                         "startSystemAudioCapture" -> {
                             pendingResult = result
-                            requestMediaProjection()
+                            requestMediaProjection(ServiceType.BLUETOOTH)
+                        }
+
+                        "startWiFiAudioStream" -> {
+                            pendingResult = result
+                            requestMediaProjection(ServiceType.WIFI)
                         }
 
                         "stopSystemAudioCapture" -> {
-                            val intent = Intent(this, AudioCaptureService::class.java).apply {
-                                action = AudioCaptureService.ACTION_STOP
-                            }
-                            startService(intent)
+                            stopService(AudioCaptureService::class.java, AudioCaptureService.ACTION_STOP)
+                            result.success(true)
+                        }
+
+                        "stopWiFiAudioStream" -> {
+                            stopService(WiFiAudioStreamingService::class.java, WiFiAudioStreamingService.ACTION_STOP)
                             result.success(true)
                         }
 
                         "isCapturing" -> {
-                            result.success(AudioCaptureService.isRunning)
+                            val btCapturing = AudioCaptureService.isRunning
+                            val wifiCapturing = WiFiAudioStreamingService.isRunning
+                            result.success(btCapturing || wifiCapturing)
                         }
 
                         "getMaxConnections" -> {
@@ -109,24 +120,67 @@ class MainActivity : FlutterActivity() {
                         }
 
                         "getCaptureInfo" -> {
-                            result.success(mapOf(
-                                "isRunning" to AudioCaptureService.isRunning,
-                                "connectedDevices" to AudioCaptureService.connectedDeviceCount,
-                                "platform" to "android"
-                            ))
+                            val info = if (AudioCaptureService.isRunning) {
+                                mapOf(
+                                    "isRunning" to true,
+                                    "connectedDevices" to AudioCaptureService.connectedDeviceCount,
+                                    "platform" to "android",
+                                    "mode" to "bluetooth"
+                                )
+                            } else if (WiFiAudioStreamingService.isRunning) {
+                                mapOf(
+                                    "isRunning" to true,
+                                    "clientCount" to WiFiAudioStreamingService.clientCount,
+                                    "platform" to "android",
+                                    "mode" to "wifi"
+                                )
+                            } else {
+                                mapOf(
+                                    "isRunning" to false,
+                                    "platform" to "android"
+                                )
+                            }
+                            result.success(info)
+                        }
+
+                        "getWiFiStreamUrl" -> {
+                            if (WiFiAudioStreamingService.isRunning) {
+                                val ipAddress = getWifiIpAddress()
+                                val url = "rtsp://$ipAddress:${WiFiAudioStreamingService.BROADCAST_PORT}"
+                                result.success(url)
+                            } else {
+                                result.success(null)
+                            }
+                        }
+
+                        "switchToNextDevice" -> {
+                            // This would require modifications to AudioCaptureService
+                            // to expose a method for manual device switching
+                            result.success(false)
+                        }
+
+                        "isWiFiConnected" -> {
+                            result.success(isWiFiConnected())
                         }
 
                         else -> result.notImplemented()
                     }
                 } catch (e: SecurityException) {
-                    result.error("PERMISSION", "Bluetooth permission required: ${e.message}", null)
+                    result.error("PERMISSION", "Permission required: ${e.message}", null)
                 } catch (e: Exception) {
                     result.error("ERROR", "Unexpected error: ${e.message}", null)
                 }
             }
     }
 
-    private fun requestMediaProjection() {
+    private enum class ServiceType {
+        BLUETOOTH, WIFI
+    }
+
+    private var pendingServiceType: ServiceType = ServiceType.BLUETOOTH
+
+    private fun requestMediaProjection(serviceType: ServiceType) {
+        pendingServiceType = serviceType
         val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         startActivityForResult(manager.createScreenCaptureIntent(), MEDIA_PROJECTION_REQUEST_CODE)
     }
@@ -135,11 +189,23 @@ class MainActivity : FlutterActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == MEDIA_PROJECTION_REQUEST_CODE) {
             if (resultCode == Activity.RESULT_OK && data != null) {
-                val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
-                    action = AudioCaptureService.ACTION_START
-                    putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
-                    putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
+                val serviceIntent = when (pendingServiceType) {
+                    ServiceType.BLUETOOTH -> {
+                        Intent(this, AudioCaptureService::class.java).apply {
+                            action = AudioCaptureService.ACTION_START
+                            putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
+                            putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
+                        }
+                    }
+                    ServiceType.WIFI -> {
+                        Intent(this, WiFiAudioStreamingService::class.java).apply {
+                            action = WiFiAudioStreamingService.ACTION_START
+                            putExtra(WiFiAudioStreamingService.EXTRA_RESULT_CODE, resultCode)
+                            putExtra(WiFiAudioStreamingService.EXTRA_RESULT_DATA, data)
+                        }
+                    }
                 }
+
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     startForegroundService(serviceIntent)
                 } else {
@@ -151,6 +217,13 @@ class MainActivity : FlutterActivity() {
             }
             pendingResult = null
         }
+    }
+
+    private fun stopService(serviceClass: Class<*>, action: String) {
+        val intent = Intent(this, serviceClass).apply {
+            this.action = action
+        }
+        startService(intent)
     }
 
     private fun isDeviceConnected(device: BluetoothDevice): Boolean {
@@ -197,6 +270,37 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             result.error("ERROR", "Disconnect failed: ${e.message}", null)
         }
+    }
+
+    private fun getWifiIpAddress(): String {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = connectivityManager.activeNetwork ?: return "0.0.0.0"
+            val networkCapabilities = connectivityManager.getNetworkCapabilities(network) ?: return "0.0.0.0"
+            
+            if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                val ipInt = wifiManager.connectionInfo.ipAddress
+                return String.format(
+                    "%d.%d.%d.%d",
+                    ipInt and 0xff,
+                    ipInt shr 8 and 0xff,
+                    ipInt shr 16 and 0xff,
+                    ipInt shr 24 and 0xff
+                )
+            }
+        }
+        return "0.0.0.0"
+    }
+
+    private fun isWiFiConnected(): Boolean {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val network = connectivityManager.activeNetwork ?: return false
+            val networkCapabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+            return networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        }
+        return false
     }
 
     override fun onDestroy() {
