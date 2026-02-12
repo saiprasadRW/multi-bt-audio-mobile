@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.example.multi_bt_audio"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 35
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
